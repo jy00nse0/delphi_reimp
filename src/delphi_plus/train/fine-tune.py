@@ -16,6 +16,7 @@ from transformers import (
     TrainingArguments,
     EarlyStoppingCallback,
 )
+from transformers.trainer_utils import get_last_checkpoint
 import util
 
 logger = logging.getLogger(__name__)
@@ -49,11 +50,29 @@ MIXTURE_DATA = {
 
 
 class T5TSVDataset(Dataset):
-    """Loads a TSV file with 'inputs' and 'targets' columns for T5 fine-tuning."""
+    """Loads a NORM BANK TSV file and builds Delphi's text-to-text I/O format.
 
-    def __init__(self, file_path, tokenizer, max_input_length=512, max_target_length=128):
-        self.df = pd.read_csv(file_path, sep="\t", header=None, names=["inputs", "targets"])
+    The input is given a task specifier prefix ('[moral_single]:' for free-form /
+    yes/no), and the target jointly encodes the classification label and the
+    open-text judgment wrapped in bracket tags (Delphi+ style, consistent with the
+    prefix bracket form and free of T5's '<' -> <unk> tokenization issue):
+        [class] {class_label} [/class] [text] {text_label} [/text]
+    """
+
+    def __init__(self, file_path, tokenizer, prefix="[moral_single]:",
+                 max_input_length=512, max_target_length=128):
+        df_raw = pd.read_csv(file_path, sep="\t", index_col=0)
+        if "inputs" in df_raw.columns and "targets" in df_raw.columns:
+            # Pre-formatted file: inputs/targets already contain prefix and tags
+            self.df = df_raw[["inputs", "class", "targets"]] if "class" in df_raw.columns \
+                else df_raw[["inputs", "targets"]].assign(**{"class": ""})
+        else:
+            # Raw NORM BANK columns: input_sequence, class_label, text_label
+            self.df = df_raw[["input_sequence", "class_label", "text_label"]].rename(
+                columns={"input_sequence": "inputs", "class_label": "class", "text_label": "targets"}
+            )
         self.tokenizer = tokenizer
+        self.prefix = prefix
         self.max_input_length = max_input_length
         self.max_target_length = max_target_length
 
@@ -62,15 +81,21 @@ class T5TSVDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        # Prepend the task specifier to the input
+        input_text = f"{self.prefix} {row['inputs']}"
+        # Jointly encode classification label and open-text judgment
+        target_text = (
+            f"[class] {row['class']} [/class] [text] {row['targets']} [/text]"
+        )
         input_enc = self.tokenizer(
-            str(row["inputs"]),
+            input_text,
             max_length=self.max_input_length,
             truncation=True,
             padding="max_length",
             return_tensors="pt",
         )
         target_enc = self.tokenizer(
-            str(row["targets"]),
+            target_text,
             max_length=self.max_target_length,
             truncation=True,
             padding="max_length",
@@ -96,6 +121,8 @@ def load_mixture_dataset(mixture, split, tokenizer):
     datasets = []
     for data_dir in MIXTURE_DATA[mixture]:
         task_name = os.path.basename(data_dir)
+        # Paired (relative) tasks use '[moral_pair]:'; single tasks use '[moral_single]:'
+        prefix = "[moral_pair]:" if "comparison" in task_name else "[moral_single]:"
         # Support both 'train.tsv' and 'train.{task_name}.tsv' naming conventions
         candidates = [
             os.path.join(data_dir, f"{split}.tsv"),
@@ -103,7 +130,7 @@ def load_mixture_dataset(mixture, split, tokenizer):
         ]
         for path in candidates:
             if os.path.exists(path):
-                ds = T5TSVDataset(path, tokenizer)
+                ds = T5TSVDataset(path, tokenizer, prefix=prefix)
                 datasets.append(ds)
                 print(f"Loaded: {path}  ({len(ds)} examples)")
                 break
@@ -178,17 +205,26 @@ def fine_tune(
     result_path = util.get_result_path(
         results_dir, pretrained_model, mixture, learning_rate, batch_size
     )
+    # Store checkpoints on the large network volume (/workspace) by default so the
+    # small overlay root ('/') doesn't fill up. Absolute paths are respected as-is.
+    if not os.path.isabs(result_path):
+        result_path = os.path.join("/workspace", result_path)
     util.validate_path(results_dir, pretrained_model, PRETRAINED_MODELS)
 
     # Resolve pretrained model to its full path / HF identifier
     model_spec = PRETRAINED_MODELS.get(pretrained_model, pretrained_model)
 
-    # Determine whether to resume from an existing checkpoint
+    # Determine whether to resume from an existing checkpoint.
+    # get_last_checkpoint() finds the latest valid 'checkpoint-N' subdir inside
+    # result_path. The base model is still loaded from its pretrained spec below;
+    # the Trainer then restores weights/optimizer/scheduler/RNG/step from this dir.
     resume_from_checkpoint = None
     if continue_finetune and os.path.isdir(result_path):
-        resume_from_checkpoint = result_path
-        model_spec = result_path
-        print(f"Resuming from checkpoint: {result_path}")
+        resume_from_checkpoint = get_last_checkpoint(result_path)
+        if resume_from_checkpoint is None:
+            print(f"continue_finetune=True but no checkpoint in {result_path}; starting fresh.")
+        else:
+            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
 
     print("=" * 10, "result_path");     print(result_path)
     print("=" * 10, "model_spec");      print(model_spec)

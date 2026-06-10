@@ -2,16 +2,15 @@
 Util functions for fine-tuning and evaluating models
 """
 import os
-import seqio
 import pandas as pd
-import tensorflow_datasets as tfds
-import tensorflow as tf
 
 
 def print_task_examples(task_name, split="validation", num_ex=1):
     """
     Print examples from tasks
     """
+    import seqio
+    import tensorflow_datasets as tfds
     print("#" * 20, task_name, "#" * 20)
     task = seqio.TaskRegistry.get(task_name)
     ds = task.get_dataset(split=split, sequence_length={"inputs": 512, "targets": 128})
@@ -26,6 +25,8 @@ def print_mixture_examples(mixture_name, split="validation", num_ex=1):
     """
     Print examples from mixtures
     """
+    import seqio
+    import tensorflow_datasets as tfds
     print("#" * 20, mixture_name, "#" * 20)
     mixture = seqio.MixtureRegistry.get(mixture_name)
     ds = mixture.get_dataset(split=split,
